@@ -1,0 +1,15 @@
+*~
+*.pyc
+*.orig
+*.ropeproject
+CATKIN_IGNORE
+
+# Emacs
+.#*
+
+# QT
+*.user
+*.autosave
+
+# Pycharm
+*.idea
