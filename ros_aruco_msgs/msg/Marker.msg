@@ -1,4 +1,3 @@
 Header header
 uint32 id
-geometry_msgs/PoseWithCovariance pose
-float64 confidence
+ros_aruco_msgs/Corner[] corners
