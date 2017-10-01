@@ -1,3 +1,6 @@
+#ifndef __ROS_ARUCO_MARKER_DETECTOR_H__
+#define __ROS_ARUCO_MARKER_DETECTOR_H__
+
 #include <ros/ros.h>
 #include <ros_aruco_msgs/Corner.h>
 #include <ros_aruco_msgs/Marker.h>
@@ -13,15 +16,10 @@
 
 #include <opencv2/aruco.hpp>
 
+#include <ros_aruco/marker_config.h>
+
 namespace ros_aruco
 {
-enum PoseType
-{
-  POSE_NONE=0, //! no pose estimation
-  POSE_SINGLE, //! estimate pose of individual markers
-  POSE_BOARD, //! estimate pose of a marker board
-  POSE_CHARUCO_BOARD //! estimate pose of a charuco board
-};
 
 class MarkerDetector
 {
@@ -44,9 +42,7 @@ public:
 
 private:
   bool active_, publish_debug_image_;
-  int marker_max_id_, marker_bits_;
-  double marker_size_;
-  int pose_type_;
+  std::unique_ptr<MarkerConfig> cfg_;
 
   ros::NodeHandle nh_;
   ros::NodeHandle nh_priv_;
@@ -63,7 +59,8 @@ private:
   image_transport::Publisher pub_debug_image_;
 
   cv::Ptr<cv::aruco::DetectorParameters> params_;
-  cv::Ptr<cv::aruco::Dictionary> dict_;
+
+  std::vector<cv::Vec3d> rvecs_, tvecs_;
 };
 
 void toTF(const cv::Vec3d& rvec, const cv::Vec3d& tvec, tf2::Transform& tf)
@@ -80,14 +77,10 @@ void toTF(const cv::Vec3d& rvec, const cv::Vec3d& tvec, tf2::Transform& tf)
 
 bool MarkerDetector::configure()
 {
-  nh_priv_.param<int>("marker_bits", marker_bits_, 6);
-  nh_priv_.param<int>("marker_max_id_", marker_max_id_, 50);
-  nh_priv_.param<double>("marker_size", marker_size_, 0.05);
   nh_priv_.param<bool>("publish_debug_image", publish_debug_image_, false);
-  nh_priv_.param<int>("pose_estimation_type", pose_type_, 0);
 
+  cfg_ = MarkerConfig::create(ros::NodeHandle(nh_priv_, "marker"));
   params_ = cv::aruco::DetectorParameters::create(); // There are lot.
-  dict_ = cv::aruco::generateCustomDictionary(marker_max_id_, marker_bits_);
 
   it_.reset( new image_transport::ImageTransport(nh_) );
   sub_img_ = it_->subscribeCamera("image_raw", 5, &MarkerDetector::imageCb, this);
@@ -96,7 +89,7 @@ bool MarkerDetector::configure()
   tf_listener_.reset( new tf2_ros::TransformListener(*tf_buffer_) );
 
   pub_markers_ = nh_.advertise<ros_aruco_msgs::MarkerArray>("detections", 1);
-  if (pose_type_ > POSE_NONE) { pub_pose_ = nh_.advertise<geometry_msgs::PoseStamped>("pose",1); }
+
   if (publish_debug_image_) { pub_debug_image_ = it_->advertise("image_debug", 1); }
 
   return true;
@@ -113,6 +106,8 @@ bool MarkerDetector::cleanup()
   sub_img_.shutdown();
   it_.reset();
 
+  cfg_.reset();
+
   return true;
 }
 
@@ -124,10 +119,10 @@ void MarkerDetector::imageCb(const sensor_msgs::ImageConstPtr& img_msg,
   camera_model_.fromCameraInfo(info_msg);
   const cv::Mat img = cv_bridge::toCvShare(img_msg)->image;
 
+  double confidence; // number of detected ids / number of expected ids
   std::vector<int> ids;
   std::vector<std::vector<cv::Point2f> > corners;
-  std::vector<cv::Vec3d> rvecs, tvecs;
-  cv::aruco::detectMarkers(img, dict_, corners, ids, params_);
+  cv::aruco::detectMarkers(img, cfg_->dict, corners, ids, params_);
 
   // if we couln't find any there is nothing to do anymore
   if (ids.size() == 0) { return; }
@@ -148,22 +143,64 @@ void MarkerDetector::imageCb(const sensor_msgs::ImageConstPtr& img_msg,
   }
   pub_markers_.publish(ma);
 
-
-  if (pose_type_ == POSE_SINGLE)
+  if (cfg_->groups.size() == 0)
   {
-    // If the camera is calibrated we can actually estimate the world poses
-    // otherwise we can only find the corner points
     cv::aruco::estimatePoseSingleMarkers(
-      corners, marker_size_,
+      corners, cfg_->size,
       camera_model_.intrinsicMatrix(),
       camera_model_.distortionCoeffs(),
-      rvecs, tvecs);
+      rvecs_, tvecs_);
+    confidence = 1.;
+  }
+  else
+  {
+    rvecs_.resize(cfg_->groups.size());
+    tvecs_.resize(cfg_->groups.size());
 
-    for (size_t i=0; i<rvecs.size(); ++i)
+    for (size_t i=0; i<cfg_->groups.size(); ++i)
     {
-      tf2::Transform tf;
-      toTF(rvecs[i], tvecs[i], tf);
+      switch(cfg_->groups[i]->type)
+      {
+      case(Group::TYPE_GRID):
+      {
+        confidence = cv::aruco::estimatePoseBoard(
+          corners, ids, cfg_->groups[i]->board,
+          camera_model_.intrinsicMatrix(),
+          camera_model_.distortionCoeffs(),
+          rvecs_[i], tvecs_[i]) / double(cfg_->groups[i]->board->ids.size());
+        break;
+      }
+      case(Group::TYPE_CHARUCO):
+      case(Group::TYPE_CHARUCO_CORNERS):
+      {
+        std::vector<cv::Point2f> charuco_corners;
+        std::vector<int> charuco_ids;
+        cv::aruco::interpolateCornersCharuco(
+          corners, ids, img,
+          static_cast<cv::aruco::CharucoBoard*>(&(*cfg_->groups[i]->board)),
+          charuco_corners,
+          charuco_ids,
+          camera_model_.intrinsicMatrix(),
+          camera_model_.distortionCoeffs());
+        if(cfg_->groups[i]->type==Group::TYPE_CHARUCO)
+        {
+          cv::aruco::estimatePoseCharucoBoard(
+            charuco_corners, charuco_ids,
+            static_cast<cv::aruco::CharucoBoard*>(&(*cfg_->groups[i]->board)),
+            camera_model_.intrinsicMatrix(),
+            camera_model_.distortionCoeffs(),
+            rvecs_[i], tvecs_[i]);
+        }
+        break;
+      }
+      }
     }
+  }
+
+  for (size_t i=0; i<rvecs_.size(); ++i)
+  {
+    tf2::Transform tf;
+    toTF(rvecs_[i], tvecs_[i], tf);
   }
 
   if (publish_debug_image_)
@@ -171,13 +208,13 @@ void MarkerDetector::imageCb(const sensor_msgs::ImageConstPtr& img_msg,
     cv::Mat img_debug;
     img.copyTo(img_debug);
     cv::aruco::drawDetectedMarkers(img_debug, corners, ids);
-    for (size_t i=0; i<rvecs.size(); ++i)
+    for (size_t i=0; i<rvecs_.size(); ++i)
     {
       cv::aruco::drawAxis(
         img_debug,
         camera_model_.intrinsicMatrix(),
         camera_model_.distortionCoeffs(),
-        rvecs[i], tvecs[i], 0.1);
+        rvecs_[i], tvecs_[i], 0.1);
     }
 
     pub_debug_image_.publish(
@@ -187,3 +224,5 @@ void MarkerDetector::imageCb(const sensor_msgs::ImageConstPtr& img_msg,
 }
 
 }
+
+#endif
