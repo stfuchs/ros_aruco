@@ -24,6 +24,11 @@ target_link_libraries(marker_detector_node
   ${catkin_LIBRARIES}
 )
 
+add_executable(board_generator src/board_generator.cpp)
+target_link_libraries(board_generator
+  ${catkin_LIBRARIES}
+)
+
 ## Mark executable scripts (Python etc.) for installation
 ## in contrast to setup.py, you can choose the destination
 # install(PROGRAMS
